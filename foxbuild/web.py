@@ -9,7 +9,7 @@ from starlette.responses import Response
 from starlette.routing import Route
 
 from foxbuild.config import config
-from foxbuild.runner import clone_repo, run_check
+from foxbuild.runner import clone_repo, run_check, get_profile_filename
 
 GH_API_BASE = 'https://api.github.com'
 
@@ -25,7 +25,7 @@ def get_token():
 
 
 async def get_clients(
-        payload: dict,
+    payload: dict,
 ) -> tuple[httpx.AsyncClient, httpx.AsyncClient, str]:
     app_client = httpx.AsyncClient(
         base_url=GH_API_BASE,
@@ -61,24 +61,24 @@ async def create_check_run(payload: dict, client: httpx.AsyncClient):
 
 
 async def initiate_check_run(
-        payload: dict, client: httpx.AsyncClient, installation_token: str
+    payload: dict, client: httpx.AsyncClient, installation_token: str
 ):
     check_run_id = payload['check_run']['id']
-    workdir = config.tmp_dir / str(check_run_id)
+    workdir = config.runs_dir / str(check_run_id)
     workdir.mkdir()
     repo_name = payload['repository']['full_name']
     head_sha = payload['check_run']['head_sha']
-    s = time()
-    await clone_repo(workdir, installation_token, repo_name, head_sha)
-    print(f'Cloning repo took {int((time() - s) * 1000)} ms')
+
     resp = await client.patch(
         f'/repos/{repo_name}/check-runs/{check_run_id}', json={'status': 'in_progress'}
     )
     resp.raise_for_status()
-    s = time()
+
+    await clone_repo(workdir, installation_token, repo_name, head_sha)
+
     is_ok, result = await run_check(workdir)
     result = '\n\n'.join((x['stdout'] + '\n' + x['stderr']).strip() for x in result)
-    print(f'Run took {int((time() - s) * 1000)} ms')
+
     resp = await client.patch(
         f'/repos/{repo_name}/check-runs/{check_run_id}',
         json={
