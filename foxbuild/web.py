@@ -81,6 +81,20 @@ async def initiate_check_run(
     try:
         await runner.clone_repo(installation_token, repo_name, head_sha)
         is_ok, result = await runner.run_check()
+    except Exception:
+        resp = await client.patch(
+            f'/repos/{repo_name}/check-runs/{check_run_id}',
+            json={
+                'status': 'completed',
+                'conclusion': 'failure',
+                'output': {
+                    'title': 'Internal Foxbuild error',
+                    'summary': 'not meow :(',
+                },
+            },
+        )
+        resp.raise_for_status()
+        raise
     finally:
         await runner.cleanup()
 
