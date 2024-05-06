@@ -1,8 +1,10 @@
 import logging
 
+from foxbuild.config import config
+
 logging.basicConfig(
     format='%(asctime)s [%(name)s] %(levelname)s: %(message)s',
     level=logging.INFO,
 )
-logging.getLogger('foxbuild.runner').setLevel(logging.DEBUG)
-logging.getLogger('foxbuild.utils').setLevel(logging.DEBUG)
+if config.debug:
+    logging.getLogger('foxbuild.utils').setLevel(logging.DEBUG)

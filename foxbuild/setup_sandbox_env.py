@@ -5,7 +5,8 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from foxbuild.config import config
-from foxbuild.utils import async_check_output, NIX, get_sandbox_prefix
+from foxbuild.sandbox import Sandbox
+from foxbuild.utils import async_check_output, NIX
 
 logger = logging.getLogger(__name__)
 
@@ -44,9 +45,9 @@ async def setup_sandbox_env():
         )
 
     logger.info('Updating nix cache')
-    sandbox_prefix = get_sandbox_prefix(writable_nix_cache=True)
+    sandbox = Sandbox(writable_nix_cache=True)
     await async_check_output(
-        *sandbox_prefix,
+        *sandbox.build_cmd_prefix(),
         'bash',
         '-c',
         'nix eval --raw nixpkgs#hello && nix eval --raw poetry2nix',

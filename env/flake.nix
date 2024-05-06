@@ -60,19 +60,23 @@
             (writeShellScriptBin "bwrap-wrapper" ''
               set -euo pipefail
 
-              TARGET=/home/build/.cache/nix
+              UID_=$1
+              shift
+              GID_=$1
+              shift
+              DO_OVERLAY=$1
+              shift
 
-              # Create a throwaway overlayfs
-              TEMPDIR="$(mktemp -d)"
-              trap 'rm -rf "$TEMPDIR"' EXIT
+              if [[ $DO_OVERLAY = True ]]; then
+                TARGET=/home/build/.cache/nix
+                TEMPDIR="$(mktemp -d)"
+                mkdir -p "$TEMPDIR"/{upper,work}
+                mount -t overlay -o lowerdir="$TARGET",upperdir="$TEMPDIR"/upper,workdir="$TEMPDIR"/work none "$TARGET"
+                trap 'umount "$TARGET" && rm -rf "$TEMPDIR"' EXIT
+              fi
 
-              mkdir -p "$TEMPDIR"/{upper,work}
-              mount -t overlay -o lowerdir="$TARGET",upperdir="$TEMPDIR"/upper,workdir="$TEMPDIR"/work none "$TARGET"
-              trap 'umount "$TARGET" && rm -rf "$TEMPDIR"' EXIT
-
-              # Drop capabilities that should have been given to the wrapper then execute the original program
               chown -R build:users /home/build
-              (cd "$(pwd)" && capsh --user=build --drop=CAP_SYS_ADMIN --drop=CAP_SETPCAP --drop=CAP_DAC_OVERRIDE --drop=CAP_SETUID --drop=CAP_SETGID --caps="" --shell=/usr/bin/env -- -- "$@")
+              (cd "$(pwd)" && capsh --drop=CAP_SYS_ADMIN --drop=CAP_SETPCAP --drop=CAP_DAC_OVERRIDE --drop=CAP_SETUID --drop=CAP_SETGID --gid=$GID_ --uid=$UID_ --caps="" --shell=/usr/bin/env -- -- "$@")
               ''
             )
             (writeTextFile {

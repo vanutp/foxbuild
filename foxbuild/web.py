@@ -1,3 +1,4 @@
+import logging
 from time import time
 
 import httpx
@@ -9,7 +10,7 @@ from starlette.responses import Response
 from starlette.routing import Route
 
 from foxbuild.config import config
-from foxbuild.runner import clone_repo, run_check, get_profile_filename
+from foxbuild.runner import Runner
 
 GH_API_BASE = 'https://api.github.com'
 
@@ -45,6 +46,8 @@ async def get_clients(
 
 
 async def create_check_run(payload: dict, client: httpx.AsyncClient):
+    global s
+    s = time()
     repo_name = payload['repository']['full_name']
     resp = await client.post(
         f'/repos/{repo_name}/check-runs',
@@ -74,9 +77,13 @@ async def initiate_check_run(
     )
     resp.raise_for_status()
 
-    await clone_repo(workdir, installation_token, repo_name, head_sha)
+    runner = Runner(workdir)
+    try:
+        await runner.clone_repo(installation_token, repo_name, head_sha)
+        is_ok, result = await runner.run_check()
+    finally:
+        await runner.cleanup()
 
-    is_ok, result = await run_check(workdir)
     result = '\n\n'.join((x['stdout'] + '\n' + x['stderr']).strip() for x in result)
 
     resp = await client.patch(
@@ -88,6 +95,7 @@ async def initiate_check_run(
         },
     )
     resp.raise_for_status()
+    logging.info(f'Total {time() - s}')
 
 
 async def webhook(request: Request):
