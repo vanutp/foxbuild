@@ -83,9 +83,9 @@ class StageRunner:
     ):
         if self.use_sandbox:
             cmd_workdir = config.empty_dir
-            prefix = self.sandbox.build_cmd_prefix()
             self.sandbox.add_envs(env)
             env = {}
+            prefix = self.sandbox.build_cmd_prefix()
         else:
             cmd_workdir = self.host_workdir
             prefix = []
