@@ -1,7 +1,8 @@
-import logging
 from time import time
 
 import httpx
+import json
+import logging
 from datetime import datetime
 from joserfc import jwt
 from starlette.applications import Starlette
@@ -9,7 +10,7 @@ from starlette.requests import Request
 from starlette.responses import Response
 from starlette.routing import Route
 
-from foxbuild.config import config
+from foxbuild.config import config, OperationMode
 from foxbuild.runner import Runner
 from foxbuild.schemas import StandaloneRunInfo
 
@@ -111,7 +112,11 @@ async def initiate_check_run(
         json={
             'status': 'completed',
             'conclusion': 'success' if is_ok else 'failure',
-            'output': {'title': 'meow', 'summary': 'meowmeow', 'text': result.model_dump_json()},
+            'output': {
+                'title': 'meow',
+                'summary': 'meowmeow',
+                'text': result.model_dump_json(),
+            },
         },
     )
     resp.raise_for_status()
@@ -122,6 +127,7 @@ async def webhook(request: Request):
     payload = await request.json()
     app_client, installation_client, installation_token = await get_clients(payload)
     event = request.headers['x-github-event']
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
     if event == 'check_suite':
         if payload['action'] in ('requested', 'rerequested'):
             await create_check_run(payload, installation_client)
@@ -133,6 +139,13 @@ async def webhook(request: Request):
     return Response(None, 204)
 
 
+def on_startup():
+    if config.mode != OperationMode.standalone:
+        raise AssertionError('Bad operation mode')
+
+
 app = Starlette(
-    debug=config.debug, routes=[Route('/webhook', webhook, methods=['POST'])]
+    debug=config.debug,
+    routes=[Route('/webhook', webhook, methods=['POST'])],
+    on_startup=[on_startup],
 )

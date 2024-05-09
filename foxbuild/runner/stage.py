@@ -1,4 +1,4 @@
-import asyncio
+import os.path
 import os.path
 from asyncio import create_subprocess_exec
 
@@ -6,118 +6,28 @@ import json
 import logging
 import re
 import shutil
-import yaml
 from hashlib import sha1
 from pathlib import Path
-from pydantic import ValidationError
 from subprocess import PIPE, DEVNULL
 from tempfile import TemporaryDirectory
-from yaml import YAMLError
+from typing import TYPE_CHECKING
 
 from foxbuild.config import config, OperationMode
 from foxbuild.const import DEFAULT_IMAGE, SANDBOX_WORKDIR
-from foxbuild.exceptions import ConfigurationError
+from foxbuild.runner.utils import checkout_repo
 from foxbuild.sandbox import Sandbox
-from foxbuild.schemas import StageResult, StandaloneRunInfo, WorkflowResult, RunResult
-from foxbuild.schemas.foxfile import Foxfile, StageDef, WorkflowDef, EnvSettings
-from foxbuild.utils import async_check_output, NIX, BASH, JQ, GIT
+from foxbuild.schemas import StageResult
+from foxbuild.schemas.foxfile import StageDef, WorkflowDef, EnvSettings
+from foxbuild.utils import async_check_output, NIX, BASH, JQ
+
+if TYPE_CHECKING:
+    from foxbuild.runner.runner import Runner
 
 logger = logging.getLogger(__name__)
 
 
-async def checkout_repo(run_info: StandaloneRunInfo, at: str | Path):
-    repo_path = config.repos_dir / run_info.provider / run_info.repo_name
-    if repo_path.is_dir():
-        await async_check_output(
-            GIT,
-            'fetch',
-            cwd=repo_path,
-        )
-    else:
-        repo_path.mkdir(parents=True)
-        await async_check_output(
-            GIT,
-            'clone',
-            '--bare',
-            run_info.clone_url,
-            '.',
-            cwd=repo_path,
-        )
-    await async_check_output(
-        GIT,
-        'clone',
-        repo_path,
-        '.',
-        cwd=at,
-    )
-    await async_check_output(
-        GIT,
-        'switch',
-        '-d',
-        run_info.commit_sha,
-        cwd=at,
-    )
-
-
-class Runner:
-    foxfile: Foxfile | None
-    host_workdir: Path | None
-    run_info: StandaloneRunInfo | None
-
-    def __init__(self, host_workdir: Path | None, run_info: StandaloneRunInfo | None):
-        if host_workdir and run_info or not host_workdir and not run_info:
-            raise ValueError(
-                'One and only one of host_workdir and run_info must be set'
-            )
-        if config.mode == OperationMode.standalone and run_info is None:
-            raise ValueError('run_info must be set in standalone mode')
-        self.foxfile = None
-        self.host_workdir = host_workdir
-        self.run_info = run_info
-
-    def load_foxfile(self, repo_root: Path):
-        file = repo_root / 'foxfile.yml'
-        if not file.is_file():
-            raise ConfigurationError('Foxfile not found')
-        try:
-            self.foxfile = Foxfile.model_validate(yaml.safe_load(file.read_text()))
-        except (YAMLError, ValidationError) as e:
-            raise ConfigurationError(str(e))
-
-    async def run(self) -> RunResult:
-        if self.host_workdir:
-            self.load_foxfile(self.host_workdir)
-        else:
-            with TemporaryDirectory() as path:
-                await checkout_repo(self.run_info, path)
-                self.load_foxfile(Path(path))
-
-        results = {}
-        for workflow_name, workflow in self.foxfile.workflows.items():
-            workflow_runner = WorkflowRunner(self, workflow)
-            results[workflow_name] = await workflow_runner.run()
-        return RunResult(workflows=results)
-
-
-class WorkflowRunner:
-    runner: Runner
-    workflow: WorkflowDef
-
-    def __init__(self, runner: Runner, workflow: WorkflowDef):
-        self.runner = runner
-        self.workflow = workflow
-
-    async def run(self) -> WorkflowResult:
-        results = {}
-        for stage_name in self.workflow.stages:
-            stage = self.runner.foxfile.stages[stage_name]
-            stage_runner = StageRunner(stage_name, self.runner, self.workflow, stage)
-            results[stage_name] = await stage_runner.run()
-        return WorkflowResult(stages=results)
-
-
 class StageRunner:
-    runner: Runner
+    runner: 'Runner'
     workflow: WorkflowDef
     stage: StageDef
     host_workdir: Path
@@ -125,8 +35,8 @@ class StageRunner:
 
     def __init__(
         self,
-        stage_name: str,
-        runner: Runner,
+        workflow_stage_key: str,
+        runner: 'Runner',
         workflow: WorkflowDef,
         stage: StageDef,
     ):
@@ -135,7 +45,7 @@ class StageRunner:
                 config.runs_dir
                 / runner.run_info.provider
                 / runner.run_info.run_id
-                / stage_name
+                / workflow_stage_key
             )
             self.host_workdir.mkdir(parents=True)
         else:
@@ -341,14 +251,14 @@ class StageRunner:
         finally:
             await self.cleanup()
 
-    async def cleanup(self):
-        if self.use_sandbox:
-            await self.sandbox.cleanup()
+    async def _remove_workdir_if_needed(self):
         if config.mode == OperationMode.standalone:
             effective_workdir = (
                 SANDBOX_WORKDIR if self.use_sandbox else self.host_workdir
             )
-            dirs = (x.relative_to(self.host_workdir) for x in self.host_workdir.glob('*'))
+            dirs = (
+                x.relative_to(self.host_workdir) for x in self.host_workdir.glob('*')
+            )
             dirs = (os.path.join(effective_workdir, x) for x in dirs)
             self.sandbox.clear_env()
             try:
@@ -361,3 +271,7 @@ class StageRunner:
             finally:
                 self.sandbox.unsafe_run_as_root = False
             self.host_workdir.rmdir()
+
+    async def cleanup(self):
+        if self.use_sandbox:
+            await self.sandbox.cleanup()
