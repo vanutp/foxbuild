@@ -7,4 +7,5 @@ logging.basicConfig(
     level=logging.INFO,
 )
 if config.debug:
+    logging.getLogger('foxbuild.sandbox').setLevel(logging.DEBUG)
     logging.getLogger('foxbuild.utils').setLevel(logging.DEBUG)

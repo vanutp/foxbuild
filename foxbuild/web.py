@@ -11,6 +11,7 @@ from starlette.routing import Route
 
 from foxbuild.config import config
 from foxbuild.runner import Runner
+from foxbuild.schemas import StandaloneRunInfo
 
 GH_API_BASE = 'https://api.github.com'
 
@@ -67,8 +68,6 @@ async def initiate_check_run(
     payload: dict, client: httpx.AsyncClient, installation_token: str
 ):
     check_run_id = payload['check_run']['id']
-    workdir = config.runs_dir / str(check_run_id)
-    workdir.mkdir()
     repo_name = payload['repository']['full_name']
     head_sha = payload['check_run']['head_sha']
 
@@ -77,10 +76,16 @@ async def initiate_check_run(
     )
     resp.raise_for_status()
 
-    runner = Runner(workdir)
+    run_info = StandaloneRunInfo(
+        provider='gh',
+        clone_url=f'https://x-access-token:{installation_token}@github.com/{repo_name}.git',
+        repo_name=repo_name,
+        commit_sha=head_sha,
+        run_id=str(check_run_id),
+    )
+    runner = Runner(None, run_info)
     try:
-        await runner.clone_repo(installation_token, repo_name, head_sha)
-        is_ok, result = await runner.run_check()
+        result = await runner.run()
     except Exception:
         resp = await client.patch(
             f'/repos/{repo_name}/check-runs/{check_run_id}',
@@ -95,17 +100,18 @@ async def initiate_check_run(
         )
         resp.raise_for_status()
         raise
-    finally:
-        await runner.cleanup()
 
-    result = '\n\n'.join((x['stdout'] + '\n' + x['stderr']).strip() for x in result)
+    is_ok = all(
+        all(st.exit_code == 0 for st in wf.stages.values())
+        for wf in result.workflows.values()
+    )
 
     resp = await client.patch(
         f'/repos/{repo_name}/check-runs/{check_run_id}',
         json={
             'status': 'completed',
             'conclusion': 'success' if is_ok else 'failure',
-            'output': {'title': 'meow', 'summary': 'meowmeow', 'text': result},
+            'output': {'title': 'meow', 'summary': 'meowmeow', 'text': result.model_dump_json()},
         },
     )
     resp.raise_for_status()

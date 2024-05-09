@@ -1,63 +1,211 @@
-import logging
+import asyncio
 import os.path
 from asyncio import create_subprocess_exec
-from time import time
 
 import json
+import logging
 import re
 import shutil
 import yaml
 from hashlib import sha1
 from pathlib import Path
-from pydantic import BaseModel, field_validator
+from pydantic import ValidationError
 from subprocess import PIPE, DEVNULL
 from tempfile import TemporaryDirectory
+from yaml import YAMLError
 
-from foxbuild.config import config
+from foxbuild.config import config, OperationMode
+from foxbuild.const import DEFAULT_IMAGE, SANDBOX_WORKDIR
 from foxbuild.exceptions import ConfigurationError
 from foxbuild.sandbox import Sandbox
+from foxbuild.schemas import StageResult, StandaloneRunInfo, WorkflowResult, RunResult
+from foxbuild.schemas.foxfile import Foxfile, StageDef, WorkflowDef, EnvSettings
 from foxbuild.utils import async_check_output, NIX, BASH, JQ, GIT
 
 logger = logging.getLogger(__name__)
 
 
-class Foxfile(BaseModel):
-    # nixpkgs: str
-    use_flake: str = False
-    nix_paths: list[str] = ['flake.nix', 'flake.lock', 'shell.nix']
-    packages: list[str] | None = None
-    script: str
-
-    @field_validator('use_flake', mode='before')
-    @classmethod
-    def v_use_flake(cls, v: str | bool):
-        if v is True:
-            return '.'
-        else:
-            return v
+async def checkout_repo(run_info: StandaloneRunInfo, at: str | Path):
+    repo_path = config.repos_dir / run_info.provider / run_info.repo_name
+    if repo_path.is_dir():
+        await async_check_output(
+            GIT,
+            'fetch',
+            cwd=repo_path,
+        )
+    else:
+        repo_path.mkdir(parents=True)
+        await async_check_output(
+            GIT,
+            'clone',
+            '--bare',
+            run_info.clone_url,
+            '.',
+            cwd=repo_path,
+        )
+    await async_check_output(
+        GIT,
+        'clone',
+        repo_path,
+        '.',
+        cwd=at,
+    )
+    await async_check_output(
+        GIT,
+        'switch',
+        '-d',
+        run_info.commit_sha,
+        cwd=at,
+    )
 
 
 class Runner:
-    SANDBOX_WORKDIR = '/home/build/repo'
+    foxfile: Foxfile | None
+    host_workdir: Path | None
+    run_info: StandaloneRunInfo | None
 
-    _foxfile: Foxfile | None
-    _host_workdir: Path
-    _cmd_workdir: str | Path
-    _sandbox: Sandbox | None
+    def __init__(self, host_workdir: Path | None, run_info: StandaloneRunInfo | None):
+        if host_workdir and run_info or not host_workdir and not run_info:
+            raise ValueError(
+                'One and only one of host_workdir and run_info must be set'
+            )
+        if config.mode == OperationMode.standalone and run_info is None:
+            raise ValueError('run_info must be set in standalone mode')
+        self.foxfile = None
+        self.host_workdir = host_workdir
+        self.run_info = run_info
 
-    def __init__(self, host_workdir: Path):
-        self._host_workdir = host_workdir
-        self._foxfile = None
-        self._sandbox = None
+    def load_foxfile(self, repo_root: Path):
+        file = repo_root / 'foxfile.yml'
+        if not file.is_file():
+            raise ConfigurationError('Foxfile not found')
+        try:
+            self.foxfile = Foxfile.model_validate(yaml.safe_load(file.read_text()))
+        except (YAMLError, ValidationError) as e:
+            raise ConfigurationError(str(e))
 
-    def get_sandbox_prefix(self) -> list[str]:
-        return self._sandbox.build_cmd_prefix() if config.use_sandbox else []
+    async def run(self) -> RunResult:
+        if self.host_workdir:
+            self.load_foxfile(self.host_workdir)
+        else:
+            with TemporaryDirectory() as path:
+                await checkout_repo(self.run_info, path)
+                self.load_foxfile(Path(path))
+
+        results = {}
+        for workflow_name, workflow in self.foxfile.workflows.items():
+            workflow_runner = WorkflowRunner(self, workflow)
+            results[workflow_name] = await workflow_runner.run()
+        return RunResult(workflows=results)
+
+
+class WorkflowRunner:
+    runner: Runner
+    workflow: WorkflowDef
+
+    def __init__(self, runner: Runner, workflow: WorkflowDef):
+        self.runner = runner
+        self.workflow = workflow
+
+    async def run(self) -> WorkflowResult:
+        results = {}
+        for stage_name in self.workflow.stages:
+            stage = self.runner.foxfile.stages[stage_name]
+            stage_runner = StageRunner(stage_name, self.runner, self.workflow, stage)
+            results[stage_name] = await stage_runner.run()
+        return WorkflowResult(stages=results)
+
+
+class StageRunner:
+    runner: Runner
+    workflow: WorkflowDef
+    stage: StageDef
+    host_workdir: Path
+    sandbox: Sandbox | None
+
+    def __init__(
+        self,
+        stage_name: str,
+        runner: Runner,
+        workflow: WorkflowDef,
+        stage: StageDef,
+    ):
+        if runner.host_workdir is None:
+            self.host_workdir = (
+                config.runs_dir
+                / runner.run_info.provider
+                / runner.run_info.run_id
+                / stage_name
+            )
+            self.host_workdir.mkdir(parents=True)
+        else:
+            self.host_workdir = runner.host_workdir
+        self.runner = runner
+        self.workflow = workflow
+        self.stage = stage
+        self.sandbox = None
+
+    @property
+    def env(self) -> EnvSettings:
+        res = EnvSettings()
+
+        def set_prop(name, default):
+            if (stage_value := getattr(self.stage, name)) is not None:
+                resolved = stage_value
+            elif (root_value := getattr(self.runner.foxfile, name)) is not None:
+                resolved = root_value
+            else:
+                resolved = default
+            setattr(res, name, resolved)
+
+        set_prop('use_flake', False)
+        set_prop('nixpkgs', None)
+        set_prop('packages', None)
+        set_prop('image', DEFAULT_IMAGE)
+        return res
+
+    @property
+    def use_sandbox(self):
+        return config.always_use_sandbox or self.env.image != DEFAULT_IMAGE
+
+    async def exec_maybe_sandboxed(
+        self, *args: str, stdout=None, stderr=None, env=None
+    ):
+        if self.use_sandbox:
+            cmd_workdir = config.empty_dir
+            prefix = self.sandbox.build_cmd_prefix()
+            self.sandbox.add_envs(env)
+            env = {}
+        else:
+            cmd_workdir = self.host_workdir
+            prefix = []
+        try:
+            return await create_subprocess_exec(
+                *prefix,
+                *args,
+                cwd=cmd_workdir,
+                stdin=DEVNULL,
+                stdout=stdout,
+                stderr=stderr,
+                env=env,
+            )
+        finally:
+            if self.use_sandbox:
+                self.sandbox.clear_env()
+
+    async def check_maybe_sandboxed(self, *args: str) -> str:
+        p = await self.exec_maybe_sandboxed(*args, stdout=PIPE, stderr=None)
+        await p.wait()
+        if p.returncode:
+            logger.error(f'Process exited with code {p.returncode}')
+            raise ValueError
+        return (await p.stdout.read()).decode()
 
     def gen_nix_shell(self):
-        for package in self._foxfile.packages:
+        for package in self.env.packages:
             if not re.fullmatch(r'[a-zA-Z_][\w\-]+', package):
                 raise ValueError
-        packages = ' '.join(self._foxfile.packages)
+        packages = ' '.join(self.env.packages)
         return '''
             let 
               pkgs = import (fetchTarball "https://github.com/NixOS/nixpkgs/archive/nixpkgs-unstable.tar.gz") {};
@@ -69,9 +217,9 @@ class Runner:
             '__PACKAGES__', packages
         )
 
-    async def get_shell_variables(self, profile_name: str):
-        if self._foxfile.use_flake:
-            cmd = [self._foxfile.use_flake]
+    async def get_shell_variables(self, profile_name: str | None):
+        if self.env.use_flake:
+            cmd = [self.env.use_flake]
         else:
             cmd = [
                 '--impure',
@@ -79,42 +227,38 @@ class Runner:
                 self.gen_nix_shell(),
             ]
 
-        env_file = config.profiles_dir / (profile_name + '.rc')
-        if env_file.is_file():
-            return json.loads(env_file.read_text())
+        if profile_name:
+            env_file = config.profiles_dir / (profile_name + '.rc')
+            if env_file.is_file():
+                return json.loads(env_file.read_text())
 
         with TemporaryDirectory() as tempdir:
             os.chmod(tempdir, 0o777)
             tmp_profile = os.path.join(tempdir, 'profile')
-            self._sandbox.add_rw_bind(tempdir, tempdir)
-            rc = await async_check_output(
-                *self.get_sandbox_prefix(),
+            if self.use_sandbox:
+                self.sandbox.add_rw_bind(tempdir, tempdir)
+            rc = await self.check_maybe_sandboxed(
                 NIX,
                 'print-dev-env',
                 '--profile',
                 tmp_profile,
                 *cmd,
-                cwd=self._cmd_workdir,
             )
-            self._sandbox.remove_rw_bind(tempdir, tempdir)
-            # Already built, will just be symlinked and added to gcroots. Can be run on host
-            await async_check_output(
-                NIX,
-                'build',
-                '--out-link',
-                str(config.profiles_dir / profile_name),
-                tmp_profile,
-                cwd=config.empty_dir,
-            )
+            if self.use_sandbox:
+                self.sandbox.remove_rw_bind(tempdir, tempdir)
+            if profile_name:
+                # Already built, will just be symlinked and added to gcroots. Can be run on host
+                await async_check_output(
+                    NIX,
+                    'build',
+                    '--out-link',
+                    str(config.profiles_dir / profile_name),
+                    tmp_profile,
+                    cwd=config.empty_dir,
+                )
 
         env = json.loads(
-            await async_check_output(
-                *self.get_sandbox_prefix(),
-                BASH,
-                '-c',
-                f'{rc}\n{JQ} -n env',
-                cwd=self._cmd_workdir,
-            )
+            await self.check_maybe_sandboxed(BASH, '-c', f'{rc}\n{JQ} -n env')
         )
 
         if (
@@ -135,51 +279,21 @@ class Runner:
             if var in env:
                 del env[var]
 
-        env_file.write_text(json.dumps(env))
+        if profile_name:
+            env_file.write_text(json.dumps(env))
 
         return env
 
-    async def clone_repo(self, token: str, repo_name: str, sha: str):
-        repo_path = config.repos_dir / repo_name
-        if repo_path.is_dir():
-            await async_check_output(
-                GIT,
-                'fetch',
-                cwd=repo_path,
-            )
-        else:
-            repo_path.mkdir(parents=True)
-            await async_check_output(
-                GIT,
-                'clone',
-                '--bare',
-                f'https://x-access-token:{token}@github.com/{repo_name}.git',
-                '.',
-                cwd=repo_path,
-            )
-        await async_check_output(
-            GIT,
-            'clone',
-            str(repo_path),
-            '.',
-            cwd=self._host_workdir,
-        )
-        await async_check_output(
-            GIT,
-            'switch',
-            '-d',
-            sha,
-            cwd=self._host_workdir,
-        )
-
-    def get_profile_filename(self) -> str:
+    def get_profile_filename(self) -> str | None:
+        if self.runner.foxfile.nix_paths is None or self.env.use_flake is False:
+            return None
         paths = []
-        for entry in self._foxfile.nix_paths:
+        for entry in self.runner.foxfile.nix_paths:
             if '*' in entry:
                 paths.extend(
                     (
-                        str(x.relative_to(self._host_workdir))
-                        for x in self._host_workdir.glob(entry)
+                        str(x.relative_to(self.host_workdir))
+                        for x in self.host_workdir.glob(entry)
                     )
                 )
             else:
@@ -187,72 +301,63 @@ class Runner:
         paths.sort()
         hashes = sha1()
         for filename in paths:
-            p = self._host_workdir / filename
+            p = self.host_workdir / filename
             if not p.is_file():
                 continue
             hashes.update(filename.encode())
             hashes.update(sha1(p.read_bytes()).digest())
         return hashes.hexdigest()
 
-    async def run_check(self):
-        file = self._host_workdir / 'foxfile.yml'
-        if not file.is_file():
-            raise ConfigurationError('Foxfile not found')
-        self._foxfile = Foxfile.model_validate(yaml.safe_load(file.read_text()))
+    async def run(self) -> StageResult:
+        try:
+            if self.runner.run_info:
+                await checkout_repo(self.runner.run_info, self.host_workdir)
 
-        if config.use_sandbox:
-            self._cmd_workdir = config.empty_dir
-            self._sandbox = Sandbox(
-                overlay_nix_cache=True, workdir=self.SANDBOX_WORKDIR
+            if self.use_sandbox:
+                self.sandbox = Sandbox(
+                    overlay_nix_cache=True,
+                    workdir=SANDBOX_WORKDIR,
+                    image=self.env.image,
+                )
+                self.sandbox.add_rw_bind(str(self.host_workdir), SANDBOX_WORKDIR)
+
+            env = await self.get_shell_variables(self.get_profile_filename())
+
+            p = await self.exec_maybe_sandboxed(
+                BASH,
+                '-c',
+                'set -e\n' + self.stage.run,
+                env=env,
+                stdout=PIPE,
+                stderr=PIPE,
             )
-            self._sandbox.add_rw_bind(str(self._host_workdir), self.SANDBOX_WORKDIR)
-        else:
-            self._cmd_workdir = self._host_workdir
+            await p.wait()
 
-        s = time()
-        env = await self.get_shell_variables(self.get_profile_filename())
-        print(f'Env import took {time() - s}')
-        res = []
-        is_ok = True
-
-        self._sandbox.add_envs(env)
-
-        p = await create_subprocess_exec(
-            *self.get_sandbox_prefix(),
-            BASH,
-            '-c',
-            self._foxfile.script,
-            cwd=self._cmd_workdir,
-            env=env if not config.use_sandbox else None,
-            stdout=PIPE,
-            stderr=PIPE,
-            stdin=DEVNULL,
-        )
-        await p.wait()
-        res.append(
-            {
-                'exit_code': p.returncode,
-                'stdout': (await p.stdout.read()).decode(),
-                'stderr': (await p.stderr.read()).decode(),
-            }
-        )
-        if p.returncode:
-            is_ok = False
-        return is_ok, res
+            return StageResult(
+                exit_code=p.returncode,
+                stdout=(await p.stdout.read()).decode(),
+                stderr=(await p.stderr.read()).decode(),
+            )
+        finally:
+            await self.cleanup()
 
     async def cleanup(self):
-        if self._host_workdir.parent == config.runs_dir:
+        if self.use_sandbox:
+            await self.sandbox.cleanup()
+        if config.mode == OperationMode.standalone:
             effective_workdir = (
-                self.SANDBOX_WORKDIR if config.use_sandbox else self._host_workdir
+                SANDBOX_WORKDIR if self.use_sandbox else self.host_workdir
             )
-            dirs = (x.relative_to(self._host_workdir) for x in self._host_workdir.glob('*'))
+            dirs = (x.relative_to(self.host_workdir) for x in self.host_workdir.glob('*'))
             dirs = (os.path.join(effective_workdir, x) for x in dirs)
-            self._sandbox.clear_env()
-            await async_check_output(
-                *self.get_sandbox_prefix(),
-                'rm',
-                '-rf',
-                *dirs,
-                cwd=config.empty_dir,
-            )
-            self._host_workdir.rmdir()
+            self.sandbox.clear_env()
+            try:
+                self.sandbox.unsafe_run_as_root = True
+                await self.check_maybe_sandboxed(
+                    'rm',
+                    '-rf',
+                    *dirs,
+                )
+            finally:
+                self.sandbox.unsafe_run_as_root = False
+            self.host_workdir.rmdir()

@@ -14,9 +14,6 @@ ENV_DIR = Path(__file__).absolute().parent.parent / 'env'
 
 
 async def setup_sandbox_env():
-    if not config.use_sandbox:
-        raise ValueError('Set USE_SANDBOX=True first')
-
     if config.global_profile_dir.exists():
         if not config.global_profile_dir.is_symlink():
             raise ValueError('Global profile directory must be a symlink')
@@ -46,10 +43,13 @@ async def setup_sandbox_env():
 
     logger.info('Updating nix cache')
     sandbox = Sandbox(writable_nix_cache=True)
-    await async_check_output(
-        *sandbox.build_cmd_prefix(),
-        'bash',
-        '-c',
-        'nix eval --raw nixpkgs#hello && nix eval --raw poetry2nix',
-        cwd=config.empty_dir
-    )
+    try:
+        await async_check_output(
+            *sandbox.build_cmd_prefix(),
+            'bash',
+            '-c',
+            'nix eval --raw nixpkgs#hello && nix eval --raw poetry2nix',
+            cwd=config.empty_dir
+        )
+    finally:
+        sandbox.cleanup()
