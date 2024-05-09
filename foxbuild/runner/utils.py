@@ -27,16 +27,15 @@ async def checkout_repo(run_info: StandaloneRunInfo, at: str | Path):
     repo_path = config.repos_dir / run_info.provider / run_info.repo_name
     if repo_path.is_dir():
         await async_check_output(
-            GIT,
-            'fetch',
-            cwd=repo_path,
+            GIT, 'remote', 'set-url', 'origin', run_info.clone_url, cwd=repo_path
         )
+        await async_check_output(GIT, 'fetch', cwd=repo_path)
     else:
         repo_path.mkdir(parents=True)
         await async_check_output(
             GIT,
             'clone',
-            '--bare',
+            '--mirror',
             run_info.clone_url,
             '.',
             cwd=repo_path,
